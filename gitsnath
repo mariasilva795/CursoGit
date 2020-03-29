@@ -1,0 +1,273 @@
+<?php
+/*+***********************************************************************************
+ * The contents of this file are subject to the vtiger CRM Public License Version 1.0
+ * ("License"); You may not use this file except in compliance with the License
+ * The Original Code is:  vtiger CRM Open Source
+ * The Initial Developer of the Original Code is vtiger.
+ * Portions created by vtiger are Copyright (C) vtiger.
+ * All Rights Reserved.
+ *************************************************************************************/
+ini_set('display_errors', 1); error_reporting(1);
+include ('vendor/autoload.php');
+class Outlook_Oauth2_Connector {
+    
+    protected $service_provider = 'Outlook';
+
+    protected $source_module;
+    
+    protected $user_id;
+    
+    protected $db;
+
+    protected $table_name = 'vtiger_outlook_oauth2';
+    
+    protected $service_name;
+
+    protected $clientId;
+    
+    protected $clientSecret;
+    
+    protected $redirectUri;
+
+    protected $urlAuthorize;
+
+    protected $urlAccessToken;
+
+    protected $urlResourceOwnerDetails;
+
+    protected $scope;
+    
+    protected $state;
+
+    protected $scopes;
+    
+    public $token;
+    
+    public function __construct($module,$userId=false) {
+        global $site_URL;
+        $this->source_module = $module;
+        if($userId) $this->user_id = $userId;
+        $this->service_name = $this->service_provider . $module;
+        $this->clientId = Outlook_Config_Connector::$OAUTH_APP_ID;
+        $this->clientSecret = Outlook_Config_Connector::$OAUTH_APP_PASSWORD;
+        $this->urlAuthorize = Outlook_Config_Connector::$OAUTH_AUTHORITY . Outlook_Config_Connector::$OAUTH_AUTHORIZE_ENDPOINT;
+        $this->urlAccessToken = Outlook_Config_Connector::$OAUTH_AUTHORITY . Outlook_Config_Connector::$OAUTH_TOKEN_ENDPOINT;
+        $this->urlResourceOwnerDetails = '';
+        $this->redirectUri = $site_URL . 'integrationoutlook.php';
+        $this->scopes = Outlook_Config_Connector::$OAUTH_SCOPES;
+    }
+    
+    public function getClientId() {
+        return $this->clientId;
+    }
+    
+    public function getClientSecret() {
+        return $this->clientSecret;
+    }
+    
+    public function getRedirectUri() {
+        return $this->redirectUri;
+    }
+    
+    public function getScopes() {
+        return $this->scopes;
+    }
+    
+    public function getAccessToken() {
+        return json_encode($this->token['access_token']);
+    }
+    
+    protected function getAuthUrl() {
+        $oauthClient = new \League\OAuth2\Client\Provider\GenericProvider([
+            'clientId'                => $this->clientId,
+            'clientSecret'            => $this->clientSecret,
+            'redirectUri'             => $this->redirectUri,
+            'urlAuthorize'            => $this->urlAuthorize,
+            'urlAccessToken'          => $this->urlAccessToken,
+            'urlResourceOwnerDetails' => '',
+            'scopes'                  => $this->scopes
+        ]);
+        $authUrl = $oauthClient->getAuthorizationUrl();
+        return $authUrl;
+    }
+  
+    public function hasStoredToken() {
+        if(!isset($this->user_id)) $this->user_id = Users_Record_Model::getCurrentUserModel()->getId();
+        if(!isset($this->db)) $this->db = PearDatabase::getInstance(); 
+        $sql = 'SELECT 1 FROM ' . $this->table_name . ' WHERE userid = ? AND service = ?';
+        $params = array($this->user_id, $this->service_name);
+        $res = $this->db->pquery($sql,$params);
+        $hasStoredToken = ($this->db->num_rows($res) > 0) ? true : false;
+        return $hasStoredToken;
+    }
+    
+    public function getState($source) {
+        global $site_URL;
+        $callbackUri = $site_URL . '/index.php?module=Outlook&view=List&operation=sync&sourcemodule=' .
+                $this->source_module . '&service=' . $source;
+        $stateDetails['url'] = $callbackUri;
+        $parse = parse_url($site_URL);
+        $ipAddr = getHostByName($parse['host']);
+        // to prevent domain name forgery
+        $stateDetails['dnf'] = md5($ipAddr);
+        $state = json_encode($stateDetails,JSON_FORCE_OBJECT);
+        return $state;
+    }
+    
+    protected function setState() {
+        $this->state = $this->getState($this->service_name);
+    }
+
+    protected function showConsentScreen() {
+        header('Location: ' . $this->getAuthUrl());
+    }
+
+    protected function execOauth2($actionData){
+        $oauthClient = new \League\OAuth2\Client\Provider\GenericProvider([
+            'clientId'                => $this->clientId,
+            'clientSecret'            => $this->clientSecret,
+            'redirectUri'             => $this->redirectUri,
+            'urlAuthorize'            => $this->urlAuthorize,
+            'urlAccessToken'          => $this->urlAccessToken,
+            'urlResourceOwnerDetails' => '',
+            'scopes'                  => $this->scopes
+        ]);
+
+        try {
+            if(array_key_exists('code', $actionData)){
+                return $oauthClient->getAccessToken('authorization_code', [
+                    'code' => $actionData['code']
+                ]);
+            }else if(array_key_exists('refresh_token', $actionData)){
+                return $oauthClient->getAccessToken('refresh_token', [
+                    'refresh_token' => $actionData['refresh_token']
+                ]);
+            }else{
+                return ['response' => 'Invalid action data'];
+            }
+        }
+        catch (League\OAuth2\Client\Provider\Exception\IdentityProviderException $e) {
+            return ['error' => 'Error requesting access token', 'errorDetail' => $e->getMessage()];
+        }
+    }
+
+    protected function exchangeCodeForToken($code) {
+        return $this->execOauth2(['code' => $code]);
+    }
+    
+    protected function storeToken($token) {
+        $dataToken = [
+            'accessToken' => $token->getToken(),
+            'tokenExpires' => $token->getExpires(),
+            'refreshToken' => $token->getRefreshToken()
+        ];
+        if(!isset($this->user_id)) $this->user_id = Users_Record_Model::getCurrentUserModel()->getId();
+        if(!isset($this->db)) $this->db = PearDatabase::getInstance();
+        $refresh_token = $dataToken['refreshToken'];
+        unset($dataToken['refreshToken']);
+        $dataToken['created'] = time();
+        $accessToken = json_encode($dataToken);
+        $params = array($this->service_name,$accessToken,$refresh_token,$this->user_id);
+        $sql = 'INSERT INTO ' . $this->table_name . ' VALUES (' . generateQuestionMarks($params) . ')';
+        $this->db->pquery($sql,$params);
+    }
+    
+    protected function retreiveToken() {
+        if(!$this->user_id) $this->user_id = Users_Record_Model::getCurrentUserModel()->getId();
+        $query = 'SELECT access_token,refresh_token FROM ' . $this->table_name . ' WHERE userid=? AND service =?';
+        $params = array($this->user_id, $this->service_name);       
+        try {
+            $result = $this->db->pquery($query, $params);
+        } catch (\Throwable $th) {
+            return null;
+        }
+        $data = $this->db->fetch_array($result);
+        $decodedAccessToken = json_decode(decode_html($data['access_token']),true);
+        $refreshToken = decode_html($data['refresh_token']);
+        $tokenExpires = $decodedAccessToken['tokenExpires'];
+        
+        return array(
+            'access_token' => $decodedAccessToken,
+            'tokenExpires' => $tokenExpires,
+            'refresh_token' => $refreshToken
+        );
+    }
+    
+    protected function setToken($token) {
+        $this->token = $token;
+    }
+    
+    public function isTokenExpired() {
+        if (null == $this->token || null == $this->token['access_token']) return true;
+        $now = time() + 3600;
+        if($this->token['access_token']['tokenExpires'] <= $now){
+            $expired =  true;
+        }else{
+            $expired = false;
+        }
+        return $expired;
+    }
+    
+    protected function updateAccessToken($accesstoken,$refreshtoken) {
+        $id = Users_Record_Model::getCurrentUserModel()->getId();
+        if(!isset($this->db)) $this->db = PearDatabase::getInstance();
+        $sql = 'UPDATE ' . $this->table_name . ' SET access_token = ? , refresh_token = ? WHERE userid = ? AND service = ?';
+        $params = array($accesstoken, $refreshtoken, $id, $this->service_name);
+        $this->db->pquery($sql,$params);
+    }
+
+    public function refreshToken() {
+        if($this->token['refresh_token'] == null) throw new AppException('refresh token is null');
+        $params['refresh_token'] = $this->token['refresh_token'];
+        $accessToken = (object) $this->execOauth2($params);
+        
+        if (!property_exists($accessToken, 'error')) {
+            $dataToken = [
+                'accessToken' => $accessToken->getToken(),
+                'tokenExpires' => $accessToken->getExpires()
+            ];
+    
+            $decodedToken = $dataToken;
+            $decodedToken['created'] = time();
+            $token['access_token'] = $decodedToken;
+            $token['refresh_token'] = $accessToken->getRefreshToken();
+            $this->updateAccessToken(json_encode($decodedToken),$token['refresh_token']);
+            $this->setToken($token);
+        }
+    }
+
+    public function authorize() {
+        // if (!empty($token) && is_array($token)) {
+        //     $datetime_now = date_create(gmdate("Y-m-d\TH:i:s\Z", time()));
+        //     $datetime_refresh_token = date_create(gmdate("Y-m-d\TH:i:s\Z", $token['tokenExpires']));
+        //     $diff_datetime = date_diff($datetime_now, $datetime_refresh_token);
+        // }
+        
+        $token = $this->retreiveToken();
+        if($this->hasStoredToken() && !empty($token)) {
+            $this->setToken($token);
+            if($this->isTokenExpired()) {
+               $this->refreshToken();
+            }
+
+            return $this;
+        }
+        
+        if($_REQUEST['service'] && $_REQUEST['code']) {
+            $authCode = $_REQUEST['code'];
+            $token = $this->exchangeCodeForToken($authCode);
+            if(is_object($token)){
+                $this->storeToken($token);
+                echo '<script>window.opener.sync();window.close();</script>'; exit;
+            }else{
+                echo json_encode($token); exit;
+            }
+        } else if($_REQUEST['service']) {
+            echo '<script>window.close();</script>'; exit;
+        } else {
+            $this->setState();
+            $this->showConsentScreen();
+        }
+    }   
+}
+?>
